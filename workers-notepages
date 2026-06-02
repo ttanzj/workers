@@ -20,14 +20,13 @@ function getStoragePrefix(env) {
   return prefix.endsWith('/') ? prefix : prefix + '/';
 }
 
-// 移除未使用的复杂加密函数，大幅精简 S3 签名逻辑
+// S3 签名与请求逻辑
 async function s3Request(env, method, key, options = {}) {
   const endpoint = Math.random() > 0.5 ? (env.S3_ENDPOINT_BACKUP || env.S3_ENDPOINT) : env.S3_ENDPOINT;
   const bucket = env.S3_BUCKET;
   const accessKey = env.S3_ACCESS_KEY;
   const secretKey = env.S3_SECRET_KEY;
   if (!endpoint || !bucket || !accessKey || !secretKey) return { ok: false, status: 500 };
-
   const fullKey = getStoragePrefix(env) + key;
   const baseEndpoint = endpoint.replace(/\/$/, '');
   const urlString = `${baseEndpoint}/${bucket}/${fullKey.split('/').map(encodeURIComponent).join('/')}`;
@@ -37,25 +36,21 @@ async function s3Request(env, method, key, options = {}) {
   let region = 'us-east-1';
   const regionMatch = host.match(/s3\.([a-z0-9-]+)\.backblazeb2\.com/);
   if (regionMatch) region = regionMatch[1];
-  
   const date = new Date().toISOString().replace(/[:-]|\.\d{3}/g, '');
   const dateStamp = date.substring(0, 8);
   const scope = `${dateStamp}/${region}/s3/aws4_request`;
   
-  // 采用原有的 Web Crypto 计算单次基础签名，移除了嵌套的 getSignatureKey 函数调用
   const encoder = new TextEncoder();
   let kKey = await crypto.subtle.sign('HMAC', await crypto.subtle.importKey('raw', encoder.encode('AWS4' + secretKey), { name: 'HMAC', hash: 'SHA-256' }, false, ['sign']), encoder.encode(dateStamp));
   kKey = await crypto.subtle.sign('HMAC', await crypto.subtle.importKey('raw', kKey, { name: 'HMAC', hash: 'SHA-256' }, false, ['sign']), encoder.encode(region));
   kKey = await crypto.subtle.sign('HMAC', await crypto.subtle.importKey('raw', kKey, { name: 'HMAC', hash: 'SHA-256' }, false, ['sign']), encoder.encode('s3'));
   const signingKey = await crypto.subtle.sign('HMAC', await crypto.subtle.importKey('raw', kKey, { name: 'HMAC', hash: 'SHA-256' }, false, ['sign']), encoder.encode('aws4_request'));
-
   const canonicalHeaders = `host:${host}\nx-amz-content-sha256:UNSIGNED-PAYLOAD\nx-amz-date:${date}\n`;
   const canonicalRequest = [method, `/${bucket}/${fullKey.split('/').map(encodeURIComponent).join('/')}`, '', canonicalHeaders, 'host;x-amz-content-sha256;x-amz-date', 'UNSIGNED-PAYLOAD'].join('\n');
   
   const digest = await crypto.subtle.digest('SHA-256', encoder.encode(canonicalRequest));
   const canonicalRequestHash = Array.from(new Uint8Array(digest)).map(b => b.toString(16).padStart(2, '0')).join('');
   const stringToSign = ['AWS4-HMAC-SHA256', date, scope, canonicalRequestHash].join('\n');
-  
   const signatureArray = await crypto.subtle.sign('HMAC', await crypto.subtle.importKey('raw', signingKey, { name: 'HMAC', hash: 'SHA-256' }, false, ['sign']), encoder.encode(stringToSign));
   const signatureHex = Array.from(new Uint8Array(signatureArray)).map(b => b.toString(16).padStart(2, '0')).join('');
   
@@ -84,13 +79,14 @@ async function saveIndexList(env, type, list) {
   await s3Request(env, 'PUT', `${type}_index.json`, { body: JSON.stringify(list), contentType: 'application/json' });
 }
 
+// 笔记业务处理器
 async function handleNotes(request, env) {
   if (!checkAuth(request, env)) return jsonResponse({ error: 'Unauthorized' }, 401);
   const url = new URL(request.url);
   const path = url.pathname.replace('/api/notes', '');
 
   if (request.method === 'GET' && path === '') return jsonResponse(await getIndexList(env, 'notes'));
-
+  
   if (request.method === 'PUT' && path === '/reorder') {
     const body = await request.json();
     if (Array.isArray(body.notes)) {
@@ -100,7 +96,6 @@ async function handleNotes(request, env) {
     return jsonResponse({ error: 'Invalid data' }, 400);
   }
 
-  // 精简合并 POST 与 PUT 中更新索引列表的冗余部分
   if (request.method === 'POST' || (request.method === 'PUT' && path)) {
     const body = await request.json();
     const noteId = request.method === 'POST' ? (body.id || Date.now().toString()) : path.slice(1);
@@ -117,7 +112,8 @@ async function handleNotes(request, env) {
     const notes = await getIndexList(env, 'notes');
     const summary = { id: note.id, title: note.title, createdAt: note.createdAt, updatedAt: note.updatedAt };
     const idx = notes.findIndex(n => n.id === noteId);
-    if (idx > -1) notes[idx] = summary; else (request.method === 'POST' ? notes.unshift(summary) : notes.push(summary));
+    if (idx > -1) notes[idx] = summary;
+    else (request.method === 'POST' ? notes.unshift(summary) : notes.push(summary));
     await saveIndexList(env, 'notes', notes);
     return jsonResponse(note);
   }
@@ -141,6 +137,7 @@ async function handleNotes(request, env) {
   return jsonResponse({ error: 'Method not allowed' }, 405);
 }
 
+// 文件业务处理器
 async function handleFiles(request, env) {
   if (!checkAuth(request, env)) return jsonResponse({ error: 'Unauthorized' }, 401);
   const url = new URL(request.url);
@@ -156,7 +153,6 @@ async function handleFiles(request, env) {
     if (!file) return jsonResponse({ error: 'No file provided' }, 400);
     const fileId = `${Date.now()}-${file.name.replace(/[^a-zA-Z0-9.-]/g, '_')}`;
     if (!(await s3Request(env, 'PUT', `files/${fileId}`, { body: await file.arrayBuffer(), contentType: file.type || 'application/octet-stream' })).ok) return jsonResponse({ error: 'Upload failed' }, 500);
-    
     const meta = { id: fileId, name: file.name, size: file.size, type: file.type, uploadedAt: new Date().toISOString() };
     const files = await getIndexList(env, 'files');
     files.push(meta);
@@ -173,17 +169,22 @@ async function handleFiles(request, env) {
   return jsonResponse({ error: 'Method not allowed' }, 405);
 }
 
+// 下载处理器
 async function handleDownload(request, env) {
   const fileId = new URL(request.url).pathname.split('/').pop();
   const fileResponse = await s3Request(env, 'GET', `files/${fileId}`);
   if (!fileResponse.ok) return new Response('File not found', { status: 404 });
   const meta = (await getIndexList(env, 'files')).find(f => f.id === fileId);
-
   return new Response(fileResponse.body, {
-    headers: { ...corsHeaders, 'Content-Type': meta?.type || 'application/octet-stream', 'Content-Disposition': `attachment; filename="${encodeURIComponent(meta?.name || fileId)}"` }
+    headers: { 
+      ...corsHeaders, 
+      'Content-Type': meta?.type || 'application/octet-stream', 
+      'Content-Disposition': `attachment; filename="${encodeURIComponent(meta?.name || fileId)}"` 
+    }
   });
 }
 
+// 前端 HTML 模板
 const HTML = `<!DOCTYPE html>
 <html>
 <head>
@@ -230,13 +231,12 @@ const HTML = `<!DOCTYPE html>
         .editor-header { padding: 12px 16px; border-bottom: 1px solid #e8e8e8; }
         .title-input { width: 100%; font-size: 18px; font-weight: 600; border: none; outline: none; }
         .editor-content { flex: 1; padding: 16px; font-size: 15px; line-height: 1.6; border: none; resize: none; outline: none; }
-        .note-item { padding: 12px 16px; cursor: grab; border-bottom: 1px solid #f0f0f0; display: flex; justify-content: space-between; align-items: center; gap: 8px; user-select: none; transition: background 0.2s; }
-        .note-item:active { cursor: grabbing; }
+        .note-item { padding: 12px 16px; cursor: pointer; border-bottom: 1px solid #f0f0f0; display: flex; justify-content: space-between; align-items: center; gap: 8px; user-select: none; transition: background 0.2s; }
         .note-item:hover { background: #fafafa; }
         .note-item:hover .btn-text-danger, .note-item.active .btn-text-danger { display: inline-block; }
         .note-item.active { background: #e6f7ff; }
         .note-item.dragging { opacity: 0.4; background: #fafafa; border: 1px dashed #1890ff; }
-        .note-info { flex: 1; min-width: 0; }
+        .note-info { flex: 1; min-width: 0; pointer-events: none; }
         .note-title { font-weight: 500; font-size: 14px; margin-bottom: 4px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
         .note-date { font-size: 12px; color: #999; }
         .sidebar-header { padding: 12px 16px; border-bottom: 1px solid #e8e8e8; display: flex; justify-content: space-between; align-items: center; }
@@ -329,7 +329,7 @@ const HTML = `<!DOCTYPE html>
         const state = { notes: [], files: [], currentNote: null, activeTab: 'notes' };
         const API_BASE = '';
         const $ = id => document.getElementById(id);
-
+        
         function authenticatedFetch(url, options = {}) {
             options.headers = options.headers || {};
             options.headers['Authorization'] = localStorage.getItem('notepages_pwd') || '';
@@ -385,14 +385,20 @@ const HTML = `<!DOCTYPE html>
                     <button class="btn-text-danger" title="删除笔记">🗑️ 删除</button>
                 \`;
                 
-                div.onclick = () => selectNoteById(note.id);
-                div.querySelector('.btn-text-danger').onclick = e => { e.stopPropagation(); deleteNote(note.id); };
+                div.onclick = function(e) {
+                    if (e.target.classList.contains('btn-text-danger')) {
+                        e.stopPropagation();
+                        deleteNote(note.id);
+                    } else {
+                        selectNoteById(note.id);
+                    }
+                };
                 
                 div.addEventListener('dragstart', handleDragStart);
                 div.addEventListener('dragend', handleDragEnd);
-                div.addEventListener('touchstart', handleTouchStart, { passive: false });
+                
                 div.addEventListener('touchmove', handleTouchMove, { passive: false });
-                div.addEventListener('touchend', () => draggingElement && handleDragEnd.call(draggingElement));
+                div.addEventListener('touchend', handleTouchEnd);
                 
                 list.appendChild(div);
             });
@@ -409,29 +415,64 @@ const HTML = `<!DOCTYPE html>
         function handleDragOver(e) {
             e.preventDefault();
             const list = $('notesList');
-            const afterElement = getDragAfterElement(list, e.clientY || e.touches?.[0].clientY);
-            if (afterElement == null) list.appendChild(draggingElement); 
-            else list.insertBefore(draggingElement, afterElement);
+            const clientY = e.clientY || e.touches?.[0]?.clientY;
+            if (!clientY) return;
+            const afterElement = getDragAfterElement(list, clientY);
+            if (draggingElement) {
+                if (afterElement == null) list.appendChild(draggingElement); 
+                else list.insertBefore(draggingElement, afterElement);
+            }
         }
 
         async function handleDragEnd() {
+            if (!this.classList.contains('dragging')) return;
             this.classList.remove('dragging');
             draggingElement = null;
             
             const currentItems = Array.from($('notesList').querySelectorAll('.note-item'));
             state.notes = currentItems.map(item => state.notes.find(n => n.id === item.getAttribute('data-id'))).filter(Boolean);
+            try {
+                const res = await authenticatedFetch(API_BASE + '/api/notes/reorder', {
+                    method: 'PUT',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ notes: state.notes })
+                });
+                if (res.ok) {
+                    renderNotes();
+                }
+            } catch (err) { console.error('保存排序失败:', err); }
+        }
+
+        function handleTouchMove(e) {
+            if (!draggingElement) {
+                draggingElement = this;
+                this.classList.add('dragging');
+            }
+            handleDragOver(e);
+        }
+        
+        async function handleTouchEnd(e) {
+            if (!draggingElement) return;
+            draggingElement.classList.remove('dragging');
+            
+            const currentItems = Array.from($('notesList').querySelectorAll('.note-item'));
+            state.notes = currentItems.map(item => state.notes.find(n => n.id === item.getAttribute('data-id'))).filter(Boolean);
+            draggingElement = null;
             
             try {
+                // 先同步提交给服务器保存排序
                 await authenticatedFetch(API_BASE + '/api/notes/reorder', {
                     method: 'PUT',
                     headers: { 'Content-Type': 'application/json' },
                     body: JSON.stringify({ notes: state.notes })
                 });
-            } catch (err) { console.error('保存排序失败:', err); }
+            } catch (err) { 
+                console.error('保存排序失败:', err); 
+            } finally {
+                // 🛠️ 简单粗暴添加：不管提交成功还是失败，松手直接强制刷新网页
+                window.location.reload();
+            }
         }
-
-        function handleTouchStart(e) { e.preventDefault(); handleDragStart.call(this, e); }
-        function handleTouchMove(e) { e.preventDefault(); handleDragOver.call(this, e); }
 
         function getDragAfterElement(container, y) {
             return [...container.querySelectorAll('.note-item:not(.dragging)')].reduce((closest, child) => {
@@ -466,6 +507,7 @@ const HTML = `<!DOCTYPE html>
                 const div = document.createElement('div');
                 div.className = 'file-card';
                 const size = file.size < 1024 ? file.size + ' B' : file.size < 1048576 ? (file.size / 1024).toFixed(1) + ' KB' : (file.size / 1048576).toFixed(1) + ' MB';
+    
                 div.innerHTML = \`<div style="font-size:24px;margin-bottom:8px;">📄</div><div class="note-title">\${file.name}</div><div style="font-size:12px;color:#999;display:flex;gap:12px;"><span>\${size}</span><span>\${new Date(file.uploadedAt).toLocaleString('zh-CN')}</span></div><div style="margin-top:12px;display:flex;gap:8px;justify-content:flex-end;"><button class="btn btn-default" onclick="copyLink('\${file.id}')">复制链接</button><button class="btn btn-primary" onclick="window.open('\${API_BASE}/download/\${file.id}')">下载</button><button class="btn btn-danger" onclick="deleteFile('\${file.id}')">删除</button></div>\`;
                 list.appendChild(div);
             });
@@ -475,7 +517,8 @@ const HTML = `<!DOCTYPE html>
             const note = { id: Date.now().toString(), title: '新建笔记 ' + (state.notes.length + 1), content: '', createdAt: new Date().toISOString(), updatedAt: new Date().toISOString() };
             try {
                 if ((await authenticatedFetch(API_BASE + '/api/notes', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(note) })).ok) {
-                    await loadNotes(); selectNoteById(note.id);
+                    await loadNotes();
+                    selectNoteById(note.id);
                 } else alert('创建失败');
             } catch { alert('创建失败'); }
         }
@@ -493,6 +536,10 @@ const HTML = `<!DOCTYPE html>
                     $('lastSaved').textContent = '已保存';
                     $('lastSaved').className = 'status saved';
                     document.querySelectorAll('.note-item').forEach(item => item.classList.toggle('active', item.getAttribute('data-id') === id));
+                    
+                    if (window.innerWidth <= 768) {
+                        $('editorContent').scrollIntoView({ behavior: 'smooth' });
+                    }
                 }
             } catch (e) { console.error('拉取笔记详情失败:', e); }
         }
@@ -516,9 +563,13 @@ const HTML = `<!DOCTYPE html>
                     $('lastSaved').textContent = '已保存';
                     $('lastSaved').className = 'status saved';
                 } else {
-                    $('lastSaved').textContent = '保存失败'; $('lastSaved').className = 'status';
+                    $('lastSaved').textContent = '保存失败';
+                    $('lastSaved').className = 'status';
                 }
-            } catch { $('lastSaved').textContent = '保存失败'; $('lastSaved').className = 'status'; }
+            } catch { 
+                $('lastSaved').textContent = '保存失败';
+                $('lastSaved').className = 'status'; 
+            }
         }
         
         window.deleteFile = async function(id) {
@@ -544,7 +595,6 @@ const HTML = `<!DOCTYPE html>
             const xhr = new XMLHttpRequest();
             xhr.open('POST', API_BASE + '/api/files', true);
             xhr.setRequestHeader('Authorization', localStorage.getItem('notepages_pwd') || '');
-            
             xhr.upload.onprogress = e => {
                 if (e.lengthComputable) {
                     const displayPercent = Math.min(Math.round((e.loaded / e.total) * 100), 95);
@@ -555,9 +605,12 @@ const HTML = `<!DOCTYPE html>
             xhr.onload = () => {
                 if (xhr.status === 401) return triggerLogout();
                 if (xhr.status >= 200 && xhr.status < 300) {
-                    $('progressBar').style.width = '100%'; $('progressText').textContent = '100% 上传完成';
+                    $('progressBar').style.width = '100%';
+                    $('progressText').textContent = '100% 上传完成';
                     setTimeout(() => { resetUploadUI(); loadFiles(); }, 600);
-                } else { resetUploadUI(); alert('服务器存储失败'); }
+                } else { 
+                    resetUploadUI(); alert('服务器存储失败');
+                }
             };
             xhr.onerror = () => { resetUploadUI(); alert('网络异常，上传中断'); };
             xhr.send(formData);
@@ -575,7 +628,8 @@ const HTML = `<!DOCTYPE html>
             if(!inputPwd) return;
             const res = await fetch(API_BASE + '/api/notes', { headers: { 'Authorization': inputPwd } });
             if (res.status === 401) {
-                alert('密码错误，拒绝访问！'); $('passwordInput').value = ''; $('passwordInput').focus();
+                alert('密码错误，拒绝访问！');
+                $('passwordInput').value = ''; $('passwordInput').focus();
             } else if (res.ok) {
                 localStorage.setItem('notepages_pwd', inputPwd);
                 $('loginOverlay').style.display = 'none'; loadNotes(); loadFiles();
